@@ -101,6 +101,7 @@ app.get('/api/roster', async (req, res) => {
           tag: m.tag,
           role: ROLE_MAP[m.role] || 'member',
           trophies: m.trophies,
+          iconId: m.icon?.id || null, // ID иконки профиля игрока — для аватарки через cdn.brawlify.com
           bestBrawlerName: bestBrawler?.name || '—',
           bestBrawlerTrophies: bestBrawler?.trophies || 0,
           expLevel: p?.expLevel || null,
