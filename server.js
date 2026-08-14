@@ -348,6 +348,58 @@ app.get('/api/maps', async (req, res) => {
   }
 });
 
+// Реальная статистика по последним боям клана: собираем battlelog каждого участника
+// (обычно это последние ~25 боёв на человека, в любых режимах — не только Клубная лига)
+// и считаем общие победы/поражения + активность по картам.
+app.get('/api/battle-stats', async (req, res) => {
+  try {
+    const stats = await cached('battle-stats', async () => {
+      const club = await bsFetch(`/clubs/%23${CLUB_TAG}`);
+      const members = club.members || [];
+
+      let wins = 0, losses = 0, draws = 0;
+      const mapStats = {}; // { "Название карты": { plays, wins, losses } }
+
+      for (let i = 0; i < members.length; i += 5) {
+        const batch = members.slice(i, i + 5);
+        const batchLogs = await Promise.all(
+          batch.map((m) => bsFetch(`/players/%23${m.tag.replace('#', '')}/battlelog`).catch(() => null))
+        );
+        for (const log of batchLogs) {
+          if (!log?.items) continue;
+          for (const item of log.items) {
+            const mapName = item.event?.map || null;
+            const result = item.battle?.result; // 'victory' | 'defeat' | 'draw' — в Showdown вместо этого приходит "rank", пропускаем
+
+            if (mapName && !mapStats[mapName]) mapStats[mapName] = { plays: 0, wins: 0, losses: 0 };
+            if (mapName) mapStats[mapName].plays++;
+
+            if (result === 'victory') { wins++; if (mapName) mapStats[mapName].wins++; }
+            else if (result === 'defeat') { losses++; if (mapName) mapStats[mapName].losses++; }
+            else if (result === 'draw') { draws++; }
+          }
+        }
+      }
+
+      const decisive = wins + losses;
+      const winratePct = decisive ? Math.round((wins / decisive) * 100) : 0;
+
+      const topMaps = Object.entries(mapStats)
+        .map(([name, s]) => ({
+          name, plays: s.plays, wins: s.wins, losses: s.losses,
+          winrate: (s.wins + s.losses) ? Math.round((s.wins / (s.wins + s.losses)) * 100) : 0,
+        }))
+        .sort((a, b) => b.plays - a.plays)
+        .slice(0, 8);
+
+      return { wins, losses, draws, winratePct, topMaps, computedAt: new Date().toISOString() };
+    });
+    res.json(stats);
+  } catch (e) {
+    res.status(502).json({ error: e.message });
+  }
+});
+
 // ---------- ВХОД ЧЕРЕЗ DISCORD ----------
 
 // Middleware: проверяет JWT из заголовка Authorization: Bearer <token>
