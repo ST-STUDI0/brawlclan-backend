@@ -352,6 +352,18 @@ app.get('/api/events', async (req, res) => {
   }
 });
 
+// Состав команд конкретного события — видно всем (просто ники, без discord_id)
+app.get('/api/events/:id/lineup', async (req, res) => {
+  try {
+    const apps = await sbFetch(
+      `/applications?event_id=eq.${req.params.id}&select=discord_username,assigned_team,assigned_time,status&order=assigned_team.asc`
+    );
+    res.json(apps);
+  } catch (e) {
+    res.status(502).json({ error: e.message });
+  }
+});
+
 // Подать заявку на событие — только авторизованным участникам клана
 app.post('/api/events/:id/apply', requireAuth, async (req, res) => {
   try {
@@ -427,16 +439,37 @@ app.patch('/api/admin/applications/:id', requireAuth, requireAdmin, async (req, 
 // Создать новое событие (админ)
 app.post('/api/admin/events', requireAuth, requireAdmin, async (req, res) => {
   try {
-    const { title, description, event_date, mode } = req.body || {};
+    const { title, description, event_date, mode, format, map, stream_url } = req.body || {};
     if (!title) return res.status(400).json({ error: 'title обязателен' });
 
     const created = await sbFetch('/events', {
       method: 'POST',
       headers: { Prefer: 'return=representation' },
-      body: JSON.stringify({ title, description, event_date, mode }),
+      body: JSON.stringify({ title, description, event_date, mode, format, map, stream_url }),
     });
 
     res.json(created);
+  } catch (e) {
+    res.status(502).json({ error: e.message });
+  }
+});
+
+// Отредактировать событие: режим, карта, ссылка на стрим, результат (админ)
+app.patch('/api/admin/events/:id', requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const allowed = ['title', 'description', 'event_date', 'mode', 'format', 'map', 'stream_url', 'result'];
+    const patch = {};
+    for (const key of allowed) {
+      if (req.body?.[key] !== undefined) patch[key] = req.body[key];
+    }
+
+    await sbFetch(`/events?id=eq.${req.params.id}`, {
+      method: 'PATCH',
+      headers: { Prefer: 'return=representation' },
+      body: JSON.stringify(patch),
+    });
+
+    res.json({ ok: true });
   } catch (e) {
     res.status(502).json({ error: e.message });
   }
