@@ -6,9 +6,11 @@ require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 const NodeCache = require('node-cache');
+const jwt = require('jsonwebtoken');
 
 const app = express();
-app.use(cors()); // разрешаем сайту стучаться на этот сервер с другого домена
+app.use(cors());
+app.use(express.json());
 
 // ---------- НАСТРОЙКИ ----------
 // BS_API_BASE:
@@ -23,6 +25,41 @@ const CLUB_TAG = process.env.CLUB_TAG || '2U0U9L2PG'; // без "#", он пер
 
 if (!BS_API_TOKEN) {
   console.warn('⚠️  BS_API_TOKEN не задан — заполни .env, иначе запросы будут падать с 403');
+}
+
+// ---------- НАСТРОЙКИ: ВХОД ЧЕРЕЗ DISCORD ----------
+const DISCORD_CLIENT_ID = process.env.DISCORD_CLIENT_ID;
+const DISCORD_CLIENT_SECRET = process.env.DISCORD_CLIENT_SECRET;
+const DISCORD_REDIRECT_URI = process.env.DISCORD_REDIRECT_URI; // https://.../auth/discord/callback
+const DISCORD_GUILD_ID = process.env.DISCORD_GUILD_ID; // ID Discord-сервера клана
+const DISCORD_ROLE_ID = process.env.DISCORD_ROLE_ID; // ID роли "участник клана"
+const FRONTEND_URL = process.env.FRONTEND_URL; // https://st-studi0.github.io/brawlclan-site
+const SESSION_JWT_SECRET = process.env.SESSION_JWT_SECRET || 'change-me-please';
+const ADMIN_DISCORD_IDS = (process.env.ADMIN_DISCORD_IDS || '')
+  .split(',')
+  .map((s) => s.trim())
+  .filter(Boolean);
+
+// ---------- НАСТРОЙКИ: SUPABASE (хранение заявок на события) ----------
+const SUPABASE_URL = process.env.SUPABASE_URL;
+const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY;
+
+async function sbFetch(path, options = {}) {
+  const res = await fetch(`${SUPABASE_URL}/rest/v1${path}`, {
+    ...options,
+    headers: {
+      apikey: SUPABASE_SERVICE_KEY,
+      Authorization: `Bearer ${SUPABASE_SERVICE_KEY}`,
+      'Content-Type': 'application/json',
+      ...(options.headers || {}),
+    },
+  });
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(`Supabase ${res.status}: ${text}`);
+  }
+  const text = await res.text();
+  return text ? JSON.parse(text) : null;
 }
 
 // кэш на 10 минут — чтобы не долбить API на каждый заход посетителя сайта
@@ -198,6 +235,208 @@ app.get('/api/activity', async (req, res) => {
       };
     });
     res.json(activity);
+  } catch (e) {
+    res.status(502).json({ error: e.message });
+  }
+});
+
+// ---------- ВХОД ЧЕРЕЗ DISCORD ----------
+
+// Middleware: проверяет JWT из заголовка Authorization: Bearer <token>
+function requireAuth(req, res, next) {
+  const header = req.headers.authorization || '';
+  const token = header.startsWith('Bearer ') ? header.slice(7) : null;
+  if (!token) return res.status(401).json({ error: 'Не авторизован' });
+  try {
+    req.user = jwt.verify(token, SESSION_JWT_SECRET);
+    next();
+  } catch {
+    res.status(401).json({ error: 'Токен недействителен или истёк' });
+  }
+}
+
+function requireAdmin(req, res, next) {
+  if (!req.user?.isAdmin) return res.status(403).json({ error: 'Только для админа' });
+  next();
+}
+
+// Шаг 1: сайт перекидывает сюда кнопкой "Войти", а мы перенаправляем в Discord
+app.get('/auth/discord/login', (req, res) => {
+  const params = new URLSearchParams({
+    client_id: DISCORD_CLIENT_ID,
+    redirect_uri: DISCORD_REDIRECT_URI,
+    response_type: 'code',
+    scope: 'identify guilds.members.read',
+  });
+  res.redirect(`https://discord.com/api/oauth2/authorize?${params.toString()}`);
+});
+
+// Шаг 2: Discord возвращает сюда пользователя с временным кодом
+app.get('/auth/discord/callback', async (req, res) => {
+  const code = req.query.code;
+  if (!code) return res.redirect(`${FRONTEND_URL}#auth_error=no_code`);
+
+  try {
+    // меняем code на access_token
+    const tokenRes = await fetch('https://discord.com/api/oauth2/token', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({
+        client_id: DISCORD_CLIENT_ID,
+        client_secret: DISCORD_CLIENT_SECRET,
+        grant_type: 'authorization_code',
+        code,
+        redirect_uri: DISCORD_REDIRECT_URI,
+      }),
+    });
+    if (!tokenRes.ok) throw new Error('Не удалось обменять код на токен');
+    const tokenData = await tokenRes.json();
+
+    // получаем данные пользователя
+    const userRes = await fetch('https://discord.com/api/users/@me', {
+      headers: { Authorization: `Bearer ${tokenData.access_token}` },
+    });
+    const user = await userRes.json();
+
+    // проверяем, что человек состоит именно в нашем Discord-сервере клана
+    const memberRes = await fetch(
+      `https://discord.com/api/users/@me/guilds/${DISCORD_GUILD_ID}/member`,
+      { headers: { Authorization: `Bearer ${tokenData.access_token}` } }
+    );
+
+    if (!memberRes.ok) {
+      // не состоит в сервере клана вообще
+      return res.redirect(`${FRONTEND_URL}#auth_error=not_in_guild`);
+    }
+    const member = await memberRes.json();
+    const hasRole = (member.roles || []).includes(DISCORD_ROLE_ID);
+
+    if (!hasRole) {
+      return res.redirect(`${FRONTEND_URL}#auth_error=not_clan_member`);
+    }
+
+    const isAdmin = ADMIN_DISCORD_IDS.includes(user.id);
+    const sessionToken = jwt.sign(
+      {
+        id: user.id,
+        username: user.username,
+        avatar: user.avatar,
+        verified: true,
+        isAdmin,
+      },
+      SESSION_JWT_SECRET,
+      { expiresIn: '30d' }
+    );
+
+    res.redirect(`${FRONTEND_URL}#token=${sessionToken}`);
+  } catch (e) {
+    console.error('Discord auth error:', e.message);
+    res.redirect(`${FRONTEND_URL}#auth_error=server_error`);
+  }
+});
+
+// Проверка текущей сессии (фронтенд дёргает при загрузке страницы)
+app.get('/api/me', requireAuth, (req, res) => {
+  res.json(req.user);
+});
+
+// ---------- СОБЫТИЯ И ЗАЯВКИ ----------
+
+// Список событий — видно всем, без входа
+app.get('/api/events', async (req, res) => {
+  try {
+    const events = await sbFetch('/events?select=*&order=event_date.asc');
+    res.json(events);
+  } catch (e) {
+    res.status(502).json({ error: e.message });
+  }
+});
+
+// Подать заявку на событие — только авторизованным участникам клана
+app.post('/api/events/:id/apply', requireAuth, async (req, res) => {
+  try {
+    const eventId = req.params.id;
+    const note = (req.body?.note || '').slice(0, 300);
+
+    await sbFetch(`/applications?on_conflict=event_id,discord_id`, {
+      method: 'POST',
+      headers: { Prefer: 'resolution=merge-duplicates,return=representation' },
+      body: JSON.stringify({
+        event_id: eventId,
+        discord_id: req.user.id,
+        discord_username: req.user.username,
+        discord_avatar: req.user.avatar,
+        note,
+        status: 'pending',
+      }),
+    });
+
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(502).json({ error: e.message });
+  }
+});
+
+// Мои заявки — чтобы игрок видел на сайте, куда уже подавался
+app.get('/api/my-applications', requireAuth, async (req, res) => {
+  try {
+    const apps = await sbFetch(
+      `/applications?discord_id=eq.${req.user.id}&select=*`
+    );
+    res.json(apps);
+  } catch (e) {
+    res.status(502).json({ error: e.message });
+  }
+});
+
+// ---------- АДМИНКА (только ты) ----------
+
+// Все заявки по всем событиям — для распределения по командам
+app.get('/api/admin/applications', requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const apps = await sbFetch(
+      `/applications?select=*,events(title,event_date)&order=created_at.desc`
+    );
+    res.json(apps);
+  } catch (e) {
+    res.status(502).json({ error: e.message });
+  }
+});
+
+// Назначить команду/время конкретной заявке
+app.patch('/api/admin/applications/:id', requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const { assigned_team, assigned_time, status } = req.body || {};
+    const patch = {};
+    if (assigned_team !== undefined) patch.assigned_team = assigned_team;
+    if (assigned_time !== undefined) patch.assigned_time = assigned_time;
+    if (status !== undefined) patch.status = status;
+
+    await sbFetch(`/applications?id=eq.${req.params.id}`, {
+      method: 'PATCH',
+      headers: { Prefer: 'return=representation' },
+      body: JSON.stringify(patch),
+    });
+
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(502).json({ error: e.message });
+  }
+});
+
+// Создать новое событие (админ)
+app.post('/api/admin/events', requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const { title, description, event_date, mode } = req.body || {};
+    if (!title) return res.status(400).json({ error: 'title обязателен' });
+
+    const created = await sbFetch('/events', {
+      method: 'POST',
+      headers: { Prefer: 'return=representation' },
+      body: JSON.stringify({ title, description, event_date, mode }),
+    });
+
+    res.json(created);
   } catch (e) {
     res.status(502).json({ error: e.message });
   }
