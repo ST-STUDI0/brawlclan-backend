@@ -7,10 +7,12 @@ const express = require('express');
 const cors = require('cors');
 const NodeCache = require('node-cache');
 const jwt = require('jsonwebtoken');
+const multer = require('multer');
 
 const app = express();
 app.use(cors());
 app.use(express.json());
+const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 80 * 1024 * 1024 } }); // до 80 МБ на файл
 
 // ---------- НАСТРОЙКИ ----------
 // BS_API_BASE:
@@ -60,6 +62,27 @@ async function sbFetch(path, options = {}) {
   }
   const text = await res.text();
   return text ? JSON.parse(text) : null;
+}
+
+// Загружает файл (картинку/видео) в публичный бакет Supabase Storage "event-media"
+// и возвращает прямую публичную ссылку на него.
+async function uploadToStorage(buffer, originalName, contentType) {
+  const safeName = originalName.replace(/[^a-zA-Z0-9.\-_]/g, '_');
+  const path = `${Date.now()}-${safeName}`;
+  const res = await fetch(`${SUPABASE_URL}/storage/v1/object/event-media/${path}`, {
+    method: 'POST',
+    headers: {
+      apikey: SUPABASE_SERVICE_KEY,
+      Authorization: `Bearer ${SUPABASE_SERVICE_KEY}`,
+      'Content-Type': contentType || 'application/octet-stream',
+    },
+    body: buffer,
+  });
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(`Supabase Storage ${res.status}: ${text}`);
+  }
+  return `${SUPABASE_URL}/storage/v1/object/public/event-media/${path}`;
 }
 
 // кэш на 10 минут — чтобы не долбить API на каждый заход посетителя сайта
@@ -235,6 +258,27 @@ app.get('/api/activity', async (req, res) => {
       };
     });
     res.json(activity);
+  } catch (e) {
+    res.status(502).json({ error: e.message });
+  }
+});
+
+// Актуальный список карт Brawl Stars (через открытый справочник BrawlAPI) —
+// для выпадающего списка "выбрать карту" при создании события в админке.
+app.get('/api/maps', async (req, res) => {
+  try {
+    const maps = await cached('maps', async () => {
+      const r = await fetch('https://api.brawlapi.com/v1/maps');
+      if (!r.ok) throw new Error(`BrawlAPI maps ${r.status}`);
+      const data = await r.json();
+      return (data.list || []).map((m) => ({
+        id: m.id,
+        name: m.name,
+        mode: m.gameMode?.name || null,
+        imageUrl: m.imageUrl || null,
+      }));
+    });
+    res.json(maps);
   } catch (e) {
     res.status(502).json({ error: e.message });
   }
@@ -439,13 +483,13 @@ app.patch('/api/admin/applications/:id', requireAuth, requireAdmin, async (req, 
 // Создать новое событие (админ)
 app.post('/api/admin/events', requireAuth, requireAdmin, async (req, res) => {
   try {
-    const { title, description, event_date, mode, format, map, stream_url } = req.body || {};
+    const { title, description, event_date, mode, format, map, stream_url, image_url, video_url } = req.body || {};
     if (!title) return res.status(400).json({ error: 'title обязателен' });
 
     const created = await sbFetch('/events', {
       method: 'POST',
       headers: { Prefer: 'return=representation' },
-      body: JSON.stringify({ title, description, event_date, mode, format, map, stream_url }),
+      body: JSON.stringify({ title, description, event_date, mode, format, map, stream_url, image_url, video_url }),
     });
 
     res.json(created);
@@ -454,10 +498,10 @@ app.post('/api/admin/events', requireAuth, requireAdmin, async (req, res) => {
   }
 });
 
-// Отредактировать событие: режим, карта, ссылка на стрим, результат (админ)
+// Отредактировать событие: режим, карта, ссылка на стрим, результат, картинка, видео (админ)
 app.patch('/api/admin/events/:id', requireAuth, requireAdmin, async (req, res) => {
   try {
-    const allowed = ['title', 'description', 'event_date', 'mode', 'format', 'map', 'stream_url', 'result'];
+    const allowed = ['title', 'description', 'event_date', 'mode', 'format', 'map', 'stream_url', 'result', 'image_url', 'video_url'];
     const patch = {};
     for (const key of allowed) {
       if (req.body?.[key] !== undefined) patch[key] = req.body[key];
@@ -470,6 +514,18 @@ app.patch('/api/admin/events/:id', requireAuth, requireAdmin, async (req, res) =
     });
 
     res.json({ ok: true });
+  } catch (e) {
+    res.status(502).json({ error: e.message });
+  }
+});
+
+// Загрузка файла (картинка события или видео) — только админ.
+// Принимает multipart/form-data с полем "file", возвращает { url }.
+app.post('/api/admin/upload', requireAuth, requireAdmin, upload.single('file'), async (req, res) => {
+  try {
+    if (!req.file) return res.status(400).json({ error: 'Файл не передан' });
+    const url = await uploadToStorage(req.file.buffer, req.file.originalname, req.file.mimetype);
+    res.json({ url });
   } catch (e) {
     res.status(502).json({ error: e.message });
   }
