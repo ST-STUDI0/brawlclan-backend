@@ -92,9 +92,15 @@ app.get('/api/roster', async (req, res) => {
 
       return members.map((m, idx) => {
         const p = results[idx];
-        const bestBrawler = p?.brawlers?.length
-          ? p.brawlers.reduce((a, b) => (b.trophies > a.trophies ? b : a))
-          : null;
+        const sortedBrawlers = p?.brawlers?.length
+          ? [...p.brawlers].sort((a, b) => b.trophies - a.trophies)
+          : [];
+        const bestBrawler = sortedBrawlers[0] || null;
+        const top5Brawlers = sortedBrawlers.slice(0, 5).map((b) => ({
+          id: b.id,
+          name: b.name,
+          trophies: b.trophies,
+        }));
 
         return {
           name: m.name,
@@ -104,6 +110,7 @@ app.get('/api/roster', async (req, res) => {
           iconId: m.icon?.id || null, // ID иконки профиля игрока — для аватарки через cdn.brawlify.com
           bestBrawlerName: bestBrawler?.name || '—',
           bestBrawlerTrophies: bestBrawler?.trophies || 0,
+          top5Brawlers, // настоящий топ-5 бравлеров игрока (id, name, trophies) — для карточки профиля
           expLevel: p?.expLevel || null,
           soloWins: p?.soloVictories ?? null,
           duoWins: p?.duoVictories ?? null,
