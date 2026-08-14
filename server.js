@@ -110,6 +110,7 @@ app.get('/api/roster', async (req, res) => {
           iconId: m.icon?.id || null, // ID иконки профиля игрока — для аватарки через cdn.brawlify.com
           bestBrawlerName: bestBrawler?.name || '—',
           bestBrawlerTrophies: bestBrawler?.trophies || 0,
+          bestBrawlerId: bestBrawler?.id || null, // настоящий ID бравлера — для точной картинки через cdn.brawlify.com
           top5Brawlers, // настоящий топ-5 бравлеров игрока (id, name, trophies) — для карточки профиля
           expLevel: p?.expLevel || null,
           soloWins: p?.soloVictories ?? null,
