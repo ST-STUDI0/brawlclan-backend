@@ -130,11 +130,57 @@ app.get('/api/club', async (req, res) => {
 
 // Полный список участников клана с ролями и кубками
 // (плюс лучший бравлер каждого — требует доп. запросов к /players)
+// Сравнивает текущий состав клана с тем, что мы видели в прошлый раз (таблица roster_members),
+// и обновляет статусы: новые участники добавляются, пропавшие помечаются как "left".
+async function syncRosterMembers(members) {
+  try {
+    const existing = await sbFetch('/roster_members?select=tag,status');
+    const existingMap = new Map(existing.map((r) => [r.tag, r.status]));
+    const currentTags = new Set(members.map((m) => m.tag));
+    const nowIso = new Date().toISOString();
+
+    for (const m of members) {
+      const wasTracked = existingMap.has(m.tag);
+      const wasActive = existingMap.get(m.tag) === 'active';
+
+      if (!wasTracked) {
+        await sbFetch('/roster_members', {
+          method: 'POST',
+          body: JSON.stringify({
+            tag: m.tag, name: m.name, trophies: m.trophies, icon_id: m.icon?.id || null,
+            status: 'active', first_seen_at: nowIso, last_seen_at: nowIso,
+          }),
+        });
+      } else {
+        const patch = { name: m.name, trophies: m.trophies, icon_id: m.icon?.id || null, last_seen_at: nowIso, status: 'active' };
+        if (!wasActive) { patch.first_seen_at = nowIso; patch.left_at = null; } // вернулся в клан — считаем новым вступлением
+        await sbFetch(`/roster_members?tag=eq.${encodeURIComponent(m.tag)}`, {
+          method: 'PATCH',
+          body: JSON.stringify(patch),
+        });
+      }
+    }
+
+    for (const [tag, status] of existingMap) {
+      if (status === 'active' && !currentTags.has(tag)) {
+        await sbFetch(`/roster_members?tag=eq.${encodeURIComponent(tag)}`, {
+          method: 'PATCH',
+          body: JSON.stringify({ status: 'left', left_at: nowIso }),
+        });
+      }
+    }
+  } catch (e) {
+    console.warn('Не удалось синхронизировать историю состава:', e.message);
+  }
+}
+
 app.get('/api/roster', async (req, res) => {
   try {
     const roster = await cached('roster', async () => {
       const club = await bsFetch(`/clubs/%23${CLUB_TAG}`);
       const members = club.members || [];
+
+      syncRosterMembers(members); // не ждём — пусть пишется в фоне, на ответ не влияет
 
       // подтягиваем детальный профиль каждого игрока (лучший бравлер, винрейт и т.д.)
       // Brawl Stars API не даёт лимит запросов в доке впритык — берём с запасом,
@@ -258,6 +304,24 @@ app.get('/api/activity', async (req, res) => {
       };
     });
     res.json(activity);
+  } catch (e) {
+    res.status(502).json({ error: e.message });
+  }
+});
+
+// Кто вступил и кто вышел из клана сегодня — сравнение с сохранённой историей состава.
+app.get('/api/roster/activity', async (req, res) => {
+  try {
+    const todayStart = new Date();
+    todayStart.setHours(0, 0, 0, 0);
+    const todayIso = todayStart.toISOString();
+
+    const [joined, left] = await Promise.all([
+      sbFetch(`/roster_members?first_seen_at=gte.${todayIso}&status=eq.active&select=tag,name,trophies,icon_id,first_seen_at&order=first_seen_at.desc`),
+      sbFetch(`/roster_members?left_at=gte.${todayIso}&select=tag,name,trophies,icon_id,left_at&order=left_at.desc`),
+    ]);
+
+    res.json({ date: todayStart.toISOString().slice(0, 10), joined, left });
   } catch (e) {
     res.status(502).json({ error: e.message });
   }
