@@ -360,10 +360,13 @@ app.get('/auth/discord/callback', async (req, res) => {
     }
 
     const isAdmin = ADMIN_DISCORD_IDS.includes(user.id);
+    // Серверный никнейм (тот, что человек задал именно на сервере клана) в приоритете —
+    // многие используют его как игровой ник. Если не задан — берём обычный аккаунт-ник.
+    const displayName = member.nick || user.global_name || user.username;
     const sessionToken = jwt.sign(
       {
         id: user.id,
-        username: user.username,
+        username: displayName,
         avatar: user.avatar,
         verified: true,
         isAdmin,
