@@ -531,5 +531,35 @@ app.post('/api/admin/upload', requireAuth, requireAdmin, upload.single('file'), 
   }
 });
 
+// Удалить событие (админ). Заявки удалятся сами (on delete cascade в базе).
+// Если у события была загруженная в наше хранилище картинка/видео — удаляем и файл(ы) тоже.
+app.delete('/api/admin/events/:id', requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const [event] = await sbFetch(`/events?id=eq.${req.params.id}&select=image_url,video_url`);
+
+    const storagePrefix = `${SUPABASE_URL}/storage/v1/object/public/event-media/`;
+    const filesToDelete = [event?.image_url, event?.video_url]
+      .filter((url) => url && url.startsWith(storagePrefix))
+      .map((url) => url.slice(storagePrefix.length));
+
+    if (filesToDelete.length) {
+      await fetch(`${SUPABASE_URL}/storage/v1/object/event-media`, {
+        method: 'DELETE',
+        headers: {
+          apikey: SUPABASE_SERVICE_KEY,
+          Authorization: `Bearer ${SUPABASE_SERVICE_KEY}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ prefixes: filesToDelete }),
+      }).catch(() => {}); // не критично, если не получится — событие всё равно удалится
+    }
+
+    await sbFetch(`/events?id=eq.${req.params.id}`, { method: 'DELETE' });
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(502).json({ error: e.message });
+  }
+});
+
 const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => console.log(`✅ Backend запущен: http://localhost:${PORT}`));
