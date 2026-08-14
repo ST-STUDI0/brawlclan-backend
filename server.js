@@ -243,6 +243,99 @@ app.get('/api/player/:tag/battlelog', async (req, res) => {
   }
 });
 
+// Справочник бравлеров (редкость, картинка) — через открытый BrawlAPI, кэшируем надолго
+async function getBrawlerMeta() {
+  return cached('brawler-meta', async () => {
+    const r = await fetch('https://api.brawlapi.com/v1/brawlers');
+    if (!r.ok) throw new Error(`BrawlAPI brawlers ${r.status}`);
+    const data = await r.json();
+    const map = {};
+    (data.list || []).forEach((b) => {
+      map[b.id] = { name: b.name, rarity: b.rarity?.name || null };
+    });
+    return map;
+  });
+}
+
+// Детальная статистика игрока для модалки профиля: (1) настоящая история последних боёв
+// целиком (составы обеих команд, карта, режим, изменение кубков), (2) текущий набор бравлеров
+// игрока (уровень силы, кубки, редкость, разблокированные гаджеты/суперспособности/шестерёнки).
+// Намеренно НЕ считаем "побед/поражений по каждому бравлеру за всё время" — API этого не даёт,
+// показывать это значило бы выдавать последние пару боёв за полную историю.
+app.get('/api/player/:tag/details', async (req, res) => {
+  try {
+    const tag = req.params.tag.replace('#', '');
+    const myTag = `#${tag}`;
+
+    const details = await cached(`player-details:${tag}`, async () => {
+      const [profile, log, brawlerMeta] = await Promise.all([
+        bsFetch(`/players/%23${tag}`),
+        bsFetch(`/players/%23${tag}/battlelog`),
+        getBrawlerMeta(),
+      ]);
+
+      const battles = (log.items || []).map((item) => {
+        const battle = item.battle || {};
+        let myTeam = [];
+        let enemyTeam = [];
+
+        if (Array.isArray(battle.teams)) {
+          const idx = battle.teams.findIndex((t) => t.some((p) => p.tag === myTag));
+          if (idx !== -1) {
+            myTeam = battle.teams[idx];
+            enemyTeam = battle.teams.filter((_, i) => i !== idx).flat();
+          } else {
+            [myTeam, enemyTeam] = [battle.teams[0] || [], battle.teams[1] || []];
+          }
+        } else if (Array.isArray(battle.players)) {
+          myTeam = battle.players.filter((p) => p.tag === myTag);
+          enemyTeam = battle.players.filter((p) => p.tag !== myTag);
+        }
+
+        const mapPlayer = (p) => ({
+          name: p.name, tag: p.tag,
+          brawlerName: p.brawler?.name || null,
+          brawlerId: p.brawler?.id || null,
+          brawlerTrophies: p.brawler?.trophies ?? null,
+        });
+
+        return {
+          mode: battle.mode || item.event?.mode || null,
+          map: item.event?.map || null,
+          result: battle.result || null, // 'victory' | 'defeat' | 'draw' | null (в Showdown вместо этого — rank)
+          rank: battle.rank ?? null,
+          duration: battle.duration ?? null,
+          trophyChange: battle.trophyChange ?? null,
+          time: item.battleTime || null,
+          myTeam: myTeam.map(mapPlayer),
+          enemyTeam: enemyTeam.map(mapPlayer),
+        };
+      });
+
+      const brawlers = (profile.brawlers || [])
+        .sort((a, b) => b.trophies - a.trophies)
+        .map((b) => ({
+          id: b.id,
+          name: b.name,
+          power: b.power,
+          trophies: b.trophies,
+          highestTrophies: b.highestTrophies,
+          rank: b.rank,
+          rarity: brawlerMeta[b.id]?.rarity || null,
+          gadgetsCount: b.gadgets?.length || 0,
+          starPowersCount: b.starPowers?.length || 0,
+          gearsCount: b.gears?.length || 0,
+        }));
+
+      return { battles, brawlers };
+    });
+
+    res.json(details);
+  } catch (e) {
+    res.status(502).json({ error: e.message });
+  }
+});
+
 // "Активность сегодня": сколько участников играли за последние 24 часа.
 // Считаем сами по battlelog — API не даёт статус "онлайн"/"активность" напрямую.
 // battleTime приходит в формате "20260814T151250.000Z" (без дефисов/двоеточий).
