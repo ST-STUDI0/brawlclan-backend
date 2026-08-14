@@ -368,9 +368,21 @@ app.get('/api/activity', async (req, res) => {
               const log = await bsFetch(`/players/%23${m.tag.replace('#', '')}/battlelog`);
               const last = log.items?.[0]?.battleTime;
               const lastDate = last ? parseBattleTime(last) : null;
-              return { name: m.name, tag: m.tag, lastBattle: lastDate };
+
+              // Считаем реальный винрейт по последним боям (result есть не у всех режимов —
+              // в Showdown вместо этого приходит rank, такие бои просто не считаем)
+              let wins = 0, losses = 0;
+              for (const item of log.items || []) {
+                const result = item.battle?.result;
+                if (result === 'victory') wins++;
+                else if (result === 'defeat') losses++;
+              }
+              const decisive = wins + losses;
+              const winratePct = decisive ? Math.round((wins / decisive) * 100) : null;
+
+              return { name: m.name, tag: m.tag, lastBattle: lastDate, winratePct };
             } catch {
-              return { name: m.name, tag: m.tag, lastBattle: null };
+              return { name: m.name, tag: m.tag, lastBattle: null, winratePct: null };
             }
           })
         );
@@ -379,6 +391,7 @@ app.get('/api/activity', async (req, res) => {
             name: r.name,
             tag: r.tag,
             lastBattleAt: r.lastBattle ? r.lastBattle.toISOString() : null,
+            winratePct: r.winratePct,
           });
           if (r.lastBattle) {
             const diff = now - r.lastBattle.getTime();
