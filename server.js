@@ -472,32 +472,89 @@ function loadTopSkins() {
 }
 
 // ---------- АВТОПЕРЕВОД НА РУССКИЙ ----------
-// BrawlAPI отдаёт имена/описания только на английском. Переводим бесплатным
-// publicly-используемым эндпоинтом Google Translate (без ключа/аккаунта) и
-// кэшируем результат НАВСЕГДА (пока жив процесс) — один и тот же английский
-// текст переводится только один раз за всё время работы сервера, дальше отдаётся
-// из кэша мгновенно. Если перевод недоступен (нет интернета, лимит и т.п.) —
-// честно возвращаем исходный английский текст, а не ломаем страницу.
+// BrawlAPI отдаёт имена/описания только на английском.
+//
+// 1) Класс и редкость — у них всего по 7-10 вариантов значений, поэтому они
+//    переведены вручную один раз (официальные/устоявшиеся русские термины
+//    из игры и русскоязычного комьюнити) — это надёжнее и быстрее, чем
+//    дёргать внешний сервис перевода на каждое значение.
+// 2) Имена бравлеров, описания, стар-пауэры и гаджеты — это длинный и
+//    постоянно растущий список (новые бравлеры выходят регулярно), вручную
+//    переводить всё и поддерживать это нереально. Для них используется
+//    бесплатный публичный сервис перевода MyMemory (без ключа/аккаунта).
+//    Результат кэшируется НАВСЕГДА (пока жив процесс) — один и тот же
+//    английский текст переводится только один раз, дальше отдаётся из кэша
+//    мгновенно. Если сервис перевода недоступен (лимит, блокировка и т.п.) —
+//    честно возвращаем исходный английский текст, а не ломаем страницу.
 const trCache = new NodeCache({ stdTTL: 0 }); // 0 = без автоудаления
+
+const CLASS_RU = {
+  Tank: 'Танк',
+  'Damage Dealer': 'Боец',
+  Marksman: 'Стрелок',
+  Artillery: 'Артиллерист',
+  Controller: 'Контроллер',
+  Assassin: 'Убийца',
+  Support: 'Поддержка',
+};
+
+const RARITY_RU = {
+  Common: 'Обычный',
+  Rare: 'Редкий',
+  'Super Rare': 'Сверхредкий',
+  Epic: 'Эпический',
+  Mythic: 'Мифический',
+  Legendary: 'Легендарный',
+  Chromatic: 'Хромированный',
+};
+
+function translateClassRu(name) {
+  return (name && CLASS_RU[name]) || name;
+}
+function translateRarityRu(name) {
+  return (name && RARITY_RU[name]) || name;
+}
 
 async function translateToRu(text) {
   if (!text || typeof text !== 'string') return text;
   const key = 'ru:' + text;
   const hit = trCache.get(key);
   if (hit) return hit;
+
+  // Основной сервис — MyMemory (бесплатный, без ключа)
+  try {
+    const url = `https://api.mymemory.translated.net/get?q=${encodeURIComponent(text)}&langpair=en|ru`;
+    const r = await fetch(url);
+    if (r.ok) {
+      const data = await r.json();
+      const translated = data?.responseData?.translatedText;
+      if (translated && !/MYMEMORY WARNING/i.test(translated)) {
+        trCache.set(key, translated);
+        return translated;
+      }
+    }
+  } catch (e) {
+    console.warn('[перевод] MyMemory недоступен:', e.message);
+  }
+
+  // Запасной вариант — неофициальный эндпоинт Google Translate
   try {
     const url = `https://translate.googleapis.com/translate_a/single?client=gtx&sl=en&tl=ru&dt=t&q=${encodeURIComponent(text)}`;
     const r = await fetch(url);
-    if (!r.ok) return text;
-    const data = await r.json();
-    const translated = (data[0] || []).map((chunk) => chunk[0]).join('');
-    const result = translated || text;
-    trCache.set(key, result);
-    return result;
+    if (r.ok) {
+      const data = await r.json();
+      const translated = (data[0] || []).map((chunk) => chunk[0]).join('');
+      if (translated) {
+        trCache.set(key, translated);
+        return translated;
+      }
+    }
   } catch (e) {
-    console.warn('[перевод] не удалось перевести, показываю английский текст:', e.message);
-    return text;
+    console.warn('[перевод] Google Translate недоступен:', e.message);
   }
+
+  // Оба сервиса недоступны — честно показываем английский текст
+  return text;
 }
 
 // Переводит сразу несколько строк параллельно, сохраняя порядок
@@ -526,16 +583,12 @@ app.get('/api/brawlers', async (req, res) => {
     const translated = await cached('brawlers-list-ru', async () => {
       return Promise.all(
         list.map(async (b) => {
-          const [nameRu, classRu, rarityRu] = await translateMany([
-            b.name,
-            b.class?.name || '',
-            b.rarity?.name || '',
-          ]);
+          const [nameRu] = await translateMany([b.name]);
           return {
             id: b.id,
             name: nameRu || b.name,
-            class: classRu || b.class?.name || null,
-            rarity: rarityRu || b.rarity?.name || null,
+            class: translateClassRu(b.class?.name) || null,
+            rarity: translateRarityRu(b.rarity?.name) || null,
             rarityColor: b.rarity?.color || null,
             icon: b.imageUrl3 || b.imageUrl || b.imageUrl2 || null,
             hasTopSkin: Boolean(topskins[b.name]),
@@ -565,12 +618,9 @@ app.get('/api/brawlers/:id', async (req, res) => {
     const topSkin = topskins[b.name] || null;
 
     const detail = await cached(`brawler-detail-ru:${b.id}`, async () => {
-      const [nameRu, classRu, rarityRu, descRu] = await translateMany([
-        b.name,
-        b.class?.name || '',
-        b.rarity?.name || '',
-        b.description || b.description2 || '',
-      ]);
+      const [nameRu, descRu] = await translateMany([b.name, b.description || b.description2 || '']);
+      const classRu = translateClassRu(b.class?.name);
+      const rarityRu = translateRarityRu(b.rarity?.name);
 
       const starPowers = await Promise.all(
         (b.starPowers || []).map(async (sp) => {
