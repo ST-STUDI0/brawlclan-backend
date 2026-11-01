@@ -8,6 +8,8 @@ const cors = require('cors');
 const NodeCache = require('node-cache');
 const jwt = require('jsonwebtoken');
 const multer = require('multer');
+const fs = require('fs');
+const path = require('path');
 
 const app = express();
 app.use(cors());
@@ -449,6 +451,97 @@ app.get('/api/maps', async (req, res) => {
       }));
     });
     res.json(maps);
+  } catch (e) {
+    res.status(502).json({ error: e.message });
+  }
+});
+
+// ---------- ГАЙДЫ ПО БРАВЛЕРАМ ----------
+// Путь к файлу с твоими (админскими) рекомендациями топ-скинов.
+// Создай topskins.json рядом с server.js и заполняй как в topskins-README.md.
+const TOPSKINS_PATH = path.join(__dirname, 'topskins.json');
+
+function loadTopSkins() {
+  try {
+    const raw = fs.readFileSync(TOPSKINS_PATH, 'utf8');
+    return JSON.parse(raw);
+  } catch (e) {
+    console.warn('[гайды] topskins.json не найден или сломан — топ-скины будут пустыми:', e.message);
+    return {};
+  }
+}
+
+// Полные данные по всем бравлерам с BrawlAPI (картинка, класс, редкость, описание,
+// стар-пауэры, гаджеты) — кэшируем так же, как список карт выше.
+async function getAllBrawlersFull() {
+  return cached('brawlers-full', async () => {
+    const r = await fetch('https://api.brawlapi.com/v1/brawlers');
+    if (!r.ok) throw new Error(`BrawlAPI brawlers ${r.status}`);
+    const data = await r.json();
+    return data.list || [];
+  });
+}
+
+// Лёгкий список для грида карточек на странице "Гайды"
+app.get('/api/brawlers', async (req, res) => {
+  try {
+    const list = await getAllBrawlersFull();
+    const topskins = loadTopSkins();
+    res.json(
+      list.map((b) => ({
+        id: b.id,
+        name: b.name,
+        class: b.class?.name || null,
+        rarity: b.rarity?.name || null,
+        rarityColor: b.rarity?.color || null,
+        icon: b.imageUrl3 || b.imageUrl || b.imageUrl2 || null,
+        hasTopSkin: Boolean(topskins[b.name]),
+      }))
+    );
+  } catch (e) {
+    res.status(502).json({ error: e.message });
+  }
+});
+
+// Полная карточка одного бравлера для модалки гайда:
+// стандартные умения (класс + описание — числовых характеристик BrawlAPI не отдаёт,
+// поэтому не выдумываем), специальные умения (стар-пауэры), бафы (гаджеты),
+// гипер (честно "нет данных" — BrawlAPI не предоставляет гиперзаряды) и топ-скин
+// (твоя собственная рекомендация из topskins.json, не факт из игрового API).
+app.get('/api/brawlers/:id', async (req, res) => {
+  try {
+    const list = await getAllBrawlersFull();
+    const b = list.find((x) => String(x.id) === String(req.params.id));
+    if (!b) return res.status(404).json({ error: 'Бравлер не найден' });
+
+    const topskins = loadTopSkins();
+    const topSkin = topskins[b.name] || null;
+
+    res.json({
+      id: b.id,
+      name: b.name,
+      class: b.class?.name || null,
+      rarity: b.rarity?.name || null,
+      image: b.imageUrl3 || b.imageUrl || b.imageUrl2 || null,
+      description: b.description || b.description2 || 'Описание пока не добавлено разработчиком игры.',
+      starPowers: (b.starPowers || []).map((sp) => ({
+        name: sp.name,
+        description: sp.description,
+        image: sp.imageUrl,
+      })),
+      gadgets: (b.gadgets || []).map((g) => ({
+        name: g.name,
+        description: g.description,
+        image: g.imageUrl,
+      })),
+      hypercharge: {
+        available: false,
+        note: 'BrawlAPI не предоставляет данные о гиперзаряде — раздел зарезервирован, если появится источник.',
+      },
+      topSkin: topSkin
+        ? { name: topSkin.name, image: topSkin.image || null, reason: topSkin.reason || '' }
+        : null,
+    });
   } catch (e) {
     res.status(502).json({ error: e.message });
   }
