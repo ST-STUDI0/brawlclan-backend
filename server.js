@@ -471,6 +471,40 @@ function loadTopSkins() {
   }
 }
 
+// ---------- АВТОПЕРЕВОД НА РУССКИЙ ----------
+// BrawlAPI отдаёт имена/описания только на английском. Переводим бесплатным
+// publicly-используемым эндпоинтом Google Translate (без ключа/аккаунта) и
+// кэшируем результат НАВСЕГДА (пока жив процесс) — один и тот же английский
+// текст переводится только один раз за всё время работы сервера, дальше отдаётся
+// из кэша мгновенно. Если перевод недоступен (нет интернета, лимит и т.п.) —
+// честно возвращаем исходный английский текст, а не ломаем страницу.
+const trCache = new NodeCache({ stdTTL: 0 }); // 0 = без автоудаления
+
+async function translateToRu(text) {
+  if (!text || typeof text !== 'string') return text;
+  const key = 'ru:' + text;
+  const hit = trCache.get(key);
+  if (hit) return hit;
+  try {
+    const url = `https://translate.googleapis.com/translate_a/single?client=gtx&sl=en&tl=ru&dt=t&q=${encodeURIComponent(text)}`;
+    const r = await fetch(url);
+    if (!r.ok) return text;
+    const data = await r.json();
+    const translated = (data[0] || []).map((chunk) => chunk[0]).join('');
+    const result = translated || text;
+    trCache.set(key, result);
+    return result;
+  } catch (e) {
+    console.warn('[перевод] не удалось перевести, показываю английский текст:', e.message);
+    return text;
+  }
+}
+
+// Переводит сразу несколько строк параллельно, сохраняя порядок
+async function translateMany(texts) {
+  return Promise.all(texts.map((t) => translateToRu(t)));
+}
+
 // Полные данные по всем бравлерам с BrawlAPI (картинка, класс, редкость, описание,
 // стар-пауэры, гаджеты) — кэшируем так же, как список карт выше.
 async function getAllBrawlersFull() {
@@ -482,22 +516,35 @@ async function getAllBrawlersFull() {
   });
 }
 
-// Лёгкий список для грида карточек на странице "Гайды"
+// Лёгкий список для грида карточек на странице "Гайды" — с переводом на русский,
+// кэшируется на 24 часа отдельно от сырых данных, чтобы не переводить на каждый запрос
 app.get('/api/brawlers', async (req, res) => {
   try {
     const list = await getAllBrawlersFull();
     const topskins = loadTopSkins();
-    res.json(
-      list.map((b) => ({
-        id: b.id,
-        name: b.name,
-        class: b.class?.name || null,
-        rarity: b.rarity?.name || null,
-        rarityColor: b.rarity?.color || null,
-        icon: b.imageUrl3 || b.imageUrl || b.imageUrl2 || null,
-        hasTopSkin: Boolean(topskins[b.name]),
-      }))
-    );
+
+    const translated = await cached('brawlers-list-ru', async () => {
+      return Promise.all(
+        list.map(async (b) => {
+          const [nameRu, classRu, rarityRu] = await translateMany([
+            b.name,
+            b.class?.name || '',
+            b.rarity?.name || '',
+          ]);
+          return {
+            id: b.id,
+            name: nameRu || b.name,
+            class: classRu || b.class?.name || null,
+            rarity: rarityRu || b.rarity?.name || null,
+            rarityColor: b.rarity?.color || null,
+            icon: b.imageUrl3 || b.imageUrl || b.imageUrl2 || null,
+            hasTopSkin: Boolean(topskins[b.name]),
+          };
+        })
+      );
+    });
+
+    res.json(translated);
   } catch (e) {
     res.status(502).json({ error: e.message });
   }
@@ -517,27 +564,46 @@ app.get('/api/brawlers/:id', async (req, res) => {
     const topskins = loadTopSkins();
     const topSkin = topskins[b.name] || null;
 
+    const detail = await cached(`brawler-detail-ru:${b.id}`, async () => {
+      const [nameRu, classRu, rarityRu, descRu] = await translateMany([
+        b.name,
+        b.class?.name || '',
+        b.rarity?.name || '',
+        b.description || b.description2 || '',
+      ]);
+
+      const starPowers = await Promise.all(
+        (b.starPowers || []).map(async (sp) => {
+          const [n, d] = await translateMany([sp.name, sp.description || '']);
+          return { name: n || sp.name, description: d || sp.description, image: sp.imageUrl };
+        })
+      );
+
+      const gadgets = await Promise.all(
+        (b.gadgets || []).map(async (g) => {
+          const [n, d] = await translateMany([g.name, g.description || '']);
+          return { name: n || g.name, description: d || g.description, image: g.imageUrl };
+        })
+      );
+
+      return {
+        id: b.id,
+        name: nameRu || b.name,
+        class: classRu || b.class?.name || null,
+        rarity: rarityRu || b.rarity?.name || null,
+        image: b.imageUrl3 || b.imageUrl || b.imageUrl2 || null,
+        description: descRu || b.description || 'Описание пока не добавлено разработчиком игры.',
+        starPowers,
+        gadgets,
+        hypercharge: {
+          available: false,
+          note: 'BrawlAPI не предоставляет данные о гиперзаряде — раздел зарезервирован, если появится источник.',
+        },
+      };
+    });
+
     res.json({
-      id: b.id,
-      name: b.name,
-      class: b.class?.name || null,
-      rarity: b.rarity?.name || null,
-      image: b.imageUrl3 || b.imageUrl || b.imageUrl2 || null,
-      description: b.description || b.description2 || 'Описание пока не добавлено разработчиком игры.',
-      starPowers: (b.starPowers || []).map((sp) => ({
-        name: sp.name,
-        description: sp.description,
-        image: sp.imageUrl,
-      })),
-      gadgets: (b.gadgets || []).map((g) => ({
-        name: g.name,
-        description: g.description,
-        image: g.imageUrl,
-      })),
-      hypercharge: {
-        available: false,
-        note: 'BrawlAPI не предоставляет данные о гиперзаряде — раздел зарезервирован, если появится источник.',
-      },
+      ...detail,
       topSkin: topSkin
         ? { name: topSkin.name, image: topSkin.image || null, reason: topSkin.reason || '' }
         : null,
